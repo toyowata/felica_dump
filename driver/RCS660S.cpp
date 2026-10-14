@@ -124,8 +124,8 @@ int RCS660S::polling(uint16_t systemCode) {
         0x95,       // Tag: Transceive
         0x06, 0x06, // Length
         0x00,       // FeliCa Polling Command (0x00)
-        (uint8_t)((systemCode >> 0) & 0xFF),
         (uint8_t)((systemCode >> 8) & 0xFF),
+        (uint8_t)((systemCode >> 0) & 0xFF),
         0x00, 0x00  // RequestCode=0x00, TimeSlot=0x00
     };
 
@@ -161,12 +161,9 @@ int RCS660S::cardCommand(
     uint8_t* responseLen)
 {
     uint16_t rlen = 0;
-    int ret = cardCommand(command, commandLen, response, &rlen);
+    int ret = cardCommand(command, commandLen, response, RCS660S_MAX_CARD_RESPONSE_LEN, &rlen);
     if (!ret) {
         return 0;
-    }
-    if (rlen > RCS660S_MAX_CARD_RESPONSE_LEN) {
-        rlen = RCS660S_MAX_CARD_RESPONSE_LEN;
     }
     if (responseLen != nullptr) {
         *responseLen = (uint8_t)rlen;
@@ -178,6 +175,7 @@ int RCS660S::cardCommand(
     const uint8_t* command,
     uint8_t commandLen,
     uint8_t* response,
+    uint16_t responseSize,
     uint16_t* responseLen)
 {
     if (command == nullptr || response == nullptr || responseLen == nullptr) {
@@ -190,38 +188,50 @@ int RCS660S::cardCommand(
     uint8_t buf[RCS660S_BUFFER_SIZE];
     uint16_t buf_len = 0;
 
-    // Build command APDU
-    buf[0] = 0xFF; // CLA
-    buf[1] = 0xC2; // INS
-    buf[2] = 0x00; // P1
-    buf[3] = 0x01; // P2 (Transparent Exchange)
-    buf[4] = (uint8_t)(commandLen + 11); // Lc
+    // カードから応答がない場合 (SW 64 01) はリトライする
+    // buf はレスポンスで上書きされるため、送信ごとにAPDUを組み立て直す
+    for (int attempt = 0; ; attempt++) {
+        // Build command APDU
+        buf[0] = 0xFF; // CLA
+        buf[1] = 0xC2; // INS
+        buf[2] = 0x00; // P1
+        buf[3] = 0x01; // P2 (Transparent Exchange)
+        buf[4] = (uint8_t)(commandLen + 10); // Lc
 
-    // Timer Data Object
-    buf[5] = 0x5F;
-    buf[6] = 0x46;
-    buf[7] = 0x04;
-    uint32_t timeout_us = this->timeout * 1000;
-    if (timeout_us == 0) timeout_us = 60000;
-    buf[8]  = (uint8_t)(timeout_us & 0xFF);
-    buf[9]  = (uint8_t)((timeout_us >> 8) & 0xFF);
-    buf[10] = (uint8_t)((timeout_us >> 16) & 0xFF);
-    buf[11] = (uint8_t)((timeout_us >> 24) & 0xFF);
+        // Timer Data Object
+        buf[5] = 0x5F;
+        buf[6] = 0x46;
+        buf[7] = 0x04;
+        uint32_t timeout_us = this->timeout * 1000;
+        if (timeout_us == 0) timeout_us = 60000;
+        buf[8]  = (uint8_t)(timeout_us & 0xFF);
+        buf[9]  = (uint8_t)((timeout_us >> 8) & 0xFF);
+        buf[10] = (uint8_t)((timeout_us >> 16) & 0xFF);
+        buf[11] = (uint8_t)((timeout_us >> 24) & 0xFF);
 
-    // Transceive Data Object
-    buf[12] = 0x95;
-    buf[13] = (uint8_t)(commandLen + 2);
-    buf[14] = (uint8_t)(commandLen + 2);
-    memcpy(buf + 15, command, commandLen);
-    buf[15 + commandLen] = 0x00;
+        // Transceive Data Object (FeliCa frame: LEN + command, LEN includes itself)
+        buf[12] = 0x95;
+        buf[13] = (uint8_t)(commandLen + 1);
+        buf[14] = (uint8_t)(commandLen + 1);
+        memcpy(buf + 15, command, commandLen);
 
-    uint32_t apdu_len = 16 + commandLen;
+        uint32_t apdu_len = 15 + commandLen;
 
-    if (!write_apdu(buf, apdu_len)) {
-        return 0;
-    }
-    if (!receive_ccid_response(buf, &buf_len)) {
-        return 0;
+        // 前の応答から次のコマンドまでの間隔を確保する
+        sleep_us(RCS660S_COMMAND_INTERVAL_US);
+
+        if (!write_apdu(buf, apdu_len)) {
+            return 0;
+        }
+        if (!receive_ccid_response(buf, &buf_len)) {
+            return 0;
+        }
+
+        bool no_response = (buf_len >= 15 && buf[0] == 0x83 &&
+                            memcmp(buf + 10, "\xC0\x03\x02\x64\x01", 5) == 0);
+        if (!no_response || attempt >= RCS660S_CARD_COMMAND_RETRY) {
+            break;
+        }
     }
 
     if (buf_len < 25 || buf[0] != 0x83 || buf[7] != 0x02) {
@@ -236,8 +246,10 @@ int RCS660S::cardCommand(
         return 0;
     }
     uint16_t card_res_len = (uint16_t)(buf[23] - 1);
-    if (card_res_len > RCS660S_MAX_CARD_RESPONSE_LEN ||
-        (uint16_t)(25 + card_res_len) > buf_len) {
+    if ((uint32_t)(25 + card_res_len) > buf_len) {
+        return 0;
+    }
+    if (card_res_len > responseSize) {
         return 0;
     }
 
@@ -314,7 +326,7 @@ void RCS660S::writeSerial(const uint8_t* data, uint16_t len) {
 
 int RCS660S::readSerial(uint8_t* data, uint16_t len) {
     uint16_t nread = 0;
-    absolute_time_t timeout_time = make_timeout_time_ms(this->timeout);
+    absolute_time_t timeout_time = make_timeout_time_ms(this->timeout + RCS660S_UART_TIMEOUT_MARGIN);
 
     while (nread < len) {
         if (uart_is_readable(this->uart_ch)) {

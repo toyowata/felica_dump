@@ -25,6 +25,9 @@
 #define RCS660S_MAX_RW_RESPONSE_LEN      265
 
 #define RCS660S_DEFAULT_TIMEOUT          1000
+#define RCS660S_UART_TIMEOUT_MARGIN      100
+#define RCS660S_CARD_COMMAND_RETRY       3
+#define RCS660S_COMMAND_INTERVAL_US      5000
 #define RCS660S_BUFFER_SIZE              512
 
 /* --------------------------------
@@ -48,6 +51,7 @@ public:
         const uint8_t* command,
         uint8_t commandLen,
         uint8_t* response,
+        uint16_t responseSize,
         uint16_t* responseLen);
     int rfOff(void);
 

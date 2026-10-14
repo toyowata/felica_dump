@@ -13,8 +13,6 @@
 static RCS660S reader(RCS660S_TX_PIN, RCS660S_RX_PIN, uart0);
 static uint8_t response[RCS660S_MAX_CARD_RESPONSE_LEN];
 
-static uint16_t swap16(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
-
 static void print_hex(const uint8_t *bytes, unsigned count) {
     for (unsigned i = 0; i < count; ++i) printf("%02X%s", bytes[i], i + 1 == count ? "" : " ");
 }
@@ -28,8 +26,8 @@ static bool command(const uint8_t *request, uint8_t request_len,
 }
 
 static bool poll(uint16_t system) {
-    // The reference driver's Polling API expects the two System Code bytes swapped.
-    return reader.polling(swap16(system)) != 0;
+    // The driver sends the System Code MSB first, matching the human-readable order.
+    return reader.polling(system) != 0;
 }
 
 static bool contains(const uint16_t *values, unsigned count, uint16_t value) {
@@ -100,34 +98,45 @@ static ReadResult read_block(uint16_t service, unsigned block, uint8_t data[16],
     return ReadResult::Data;
 }
 
-static const char *hint(uint16_t system, uint16_t service) {
-    if (system == 0x0003) {
-        switch (service) {
-            case 0x23CB: return "Suica候補";
-            case 0x1CC8: return "PASMO候補";
-            case 0x208B: return "Kitaca候補";
-            case 0x1E8B: return "TOICA候補";
-            case 0x21C8: return "SUGOCA候補";
-            case 0x1F48: return "nimoca候補";
-            case 0x2448: return "はやかけん候補";
-            case 0x9888: return "manaca候補";
-            case 0x1B88: return "PiTaPa候補";
-            case 0x2888: return "Suica+候補";
-            case 0x090A: return "Welcome Suica候補";
-            case 0x090F: return "交通系ICカード候補";
-            default: break;
-        }
-    }
-    if (system == 0xFE00) {
-        if (service == 0x110B || service == 0x1317) return "楽天Edy候補";
-        if (service == 0x558B || service == 0x5597) return "nanaco候補";
-        if (service == 0x680B || service == 0x6817) return "WAON候補";
-    }
+struct Hint { uint16_t system, service; const char *name; };
+
+// Ordered by priority: the first entry whose service exists on the card wins.
+// Transit services such as 090A/090F are shared by many cards, so they come last.
+static constexpr Hint HINTS[] = {
+    {0x0003, 0x208B, "Kitaca候補"},
+    {0x0003, 0x1E8B, "TOICA候補"},
+    {0x0003, 0x21C8, "SUGOCA候補"},
+    {0x0003, 0x1B88, "PiTaPa候補"},
+    {0x0003, 0x1CC8, "PASMO候補"},
+    {0x0003, 0x9888, "manaca候補"},
+    {0x0003, 0x1F48, "nimoca候補"},
+    {0x0003, 0x2888, "Suica+候補"},
+    {0x0003, 0x23CB, "Suica候補"},
+    {0x0003, 0x2448, "はやかけん候補"},
+    {0x0003, 0x090A, "Welcome Suica候補"},
+    {0x0003, 0x090F, "交通系ICカード候補"},
+    {0xFE00, 0x110B, "楽天Edy候補"},
+    {0xFE00, 0x1317, "楽天Edy候補"},
+    {0xFE00, 0x558B, "nanaco候補"},
+    {0xFE00, 0x5597, "nanaco候補"},
+    {0xFE00, 0x680B, "WAON候補"},
+    {0xFE00, 0x6817, "WAON候補"},
+    {0x865E, 0xBA4B, "SAPICA候補"},
+    {0x8592, 0xB00B, "PASPY候補"},
+    {0x8B5D, 0x804B, "りゅーと候補"},
+    {0x832C, 0x804B, "ecomyca候補"},
+};
+
+static const char *card_hint(uint16_t system, const uint16_t *services, unsigned count) {
     if (system == 0x88B4) return "FeliCa Lite-S候補";
-    if (system == 0x5E86 && service == 0xBA4B) return "SAPICA候補";
-    if (system == 0x9285 && service == 0xB00B) return "PASPY候補";
-    if (system == 0x5D8B && service == 0x804B) return "りゅーと候補";
-    if (system == 0x2C83 && service == 0x804B) return "ecomyca候補";
+    if (system == 0x0003 && contains(services, count, 0x008B)) {
+        // ICOCA has no distinctive service; its attribute block has card type 3 in byte 8.
+        uint8_t attr[16], s1 = 0, s2 = 0;
+        if (read_block(0x008B, 0, attr, &s1, &s2) == ReadResult::Data &&
+            (attr[8] & 0xF0) == 0x30) return "ICOCA候補";
+    }
+    for (const Hint &h : HINTS)
+        if (h.system == system && contains(services, count, h.service)) return h.name;
     return nullptr;
 }
 
@@ -192,7 +201,11 @@ static bool dump_system(uint16_t system) {
     for (unsigned index = 0; index < MAX_DISCOVERED_SERVICES; ++index) {
         uint16_t code = 0;
         bool area = false, end = false;
-        if (!search_service(index, &code, &area, &end)) break;
+        // Enumeration sometimes fails mid-way on unstable cards, so retry before giving up.
+        bool ok = false;
+        for (unsigned attempt = 0; attempt <= SEARCH_SERVICE_RETRY && !ok; ++attempt)
+            ok = search_service(index, &code, &area, &end);
+        if (!ok) break;
         search_ok = true;
         if (end) { complete = true; break; }
         if (area) {
@@ -203,12 +216,15 @@ static bool dump_system(uint16_t system) {
         }
     }
     unsigned discovered_services = count;
-    for (uint16_t code : EXTRA_SERVICE_CODES) {
-        if (count >= MAX_DISCOVERED_SERVICES) break;
-        if (!contains(services, count, code)) {
-            uint16_t version = 0;
-            if (request_service(code, &version)) services[count++] = code;
-        }
+    auto probe = [&](uint16_t code) {
+        if (count >= MAX_DISCOVERED_SERVICES || contains(services, count, code)) return;
+        uint16_t version = 0;
+        if (request_service(code, &version)) services[count++] = code;
+    };
+    for (uint16_t code : EXTRA_SERVICE_CODES) probe(code);
+    // Some cards stop Search Service Code early, so probe the card-type services too.
+    for (const Hint &h : HINTS) {
+        if (h.system == system) probe(h.service);
     }
     printf("# Number of area = %u\n", area_count);
     for (unsigned i = 0; i < area_count; ++i)
@@ -220,12 +236,7 @@ static bool dump_system(uint16_t system) {
     }
     if (!search_ok) printf("# Search Service Code unsupported or failed; only probed services are shown.\n");
     else if (!complete) printf("# Service enumeration stopped after %u entries.\n", discovered_services + area_count);
-    const char *card_hint = nullptr;
-    for (unsigned i = 0; i < count; ++i) {
-        const char *candidate = hint(system, services[i]);
-        if (candidate && (!card_hint || strstr(card_hint, "交通系ICカード候補"))) card_hint = candidate;
-    }
-    if (card_hint) printf("# Card type: %s\n", card_hint);
+    if (const char *type = card_hint(system, services, count)) printf("# Card type: %s\n", type);
     return true;
 }
 
@@ -261,7 +272,8 @@ int main() {
     stdio_init_all();
     sleep_ms(2000);
     printf("RC-S660/S FeliCa dumper\n");
-    reader.timeout = 400;
+    // Short per-command timeout; the driver retries when the card does not respond.
+    reader.timeout = 100;
     while (!reader.initDevice()) {
         printf("RC-S660/S 初期化失敗。接続を確認して再試行します。\n");
         sleep_ms(1000);

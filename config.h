@@ -7,10 +7,10 @@ static constexpr uint16_t EXTRA_SYSTEM_CODES[] = {
     0x0003, // Japanese transit IC cards
     0xFE00, // Common area (Edy, nanaco, WAON, etc.)
     0x88B4, // FeliCa Lite-S
-    0x5E86, // SAPICA
-    0x9285, // PASPY
-    0x5D8B, // ryuto
-    0x2C83, // ecomyca
+    0x865E, // SAPICA
+    0x8592, // PASPY
+    0x8B5D, // ryuto
+    0x832C, // ecomyca
 };
 
 static constexpr uint16_t EXTRA_SERVICE_CODES[] = {
@@ -32,3 +32,4 @@ static constexpr unsigned MAX_DISCOVERED_SYSTEMS = 32;
 static constexpr unsigned MAX_DISCOVERED_SERVICES = 128;
 static constexpr unsigned MAX_BLOCKS_PER_SERVICE = 256;
 static constexpr unsigned POLL_INTERVAL_MS = 300;
+static constexpr unsigned SEARCH_SERVICE_RETRY = 3;
